@@ -207,6 +207,6 @@ if __name__ == "__main__": #ignore this part, added incase we forget to remove i
     is_valid, message = lab_system.validate(scanned_string)
     print(f"Valid: {is_valid} || Message: {message}") # valid will be true
     print()
-    tampered_string = scanned_string[:-5] + "adsonefwcs"
-    is_valid, message = lab_system.validate(tampered_string)
-    print(f"Valid: {is_valid} || Message: {message}") # false, cuz random shit
+    # tampered_string = scanned_string[:-5] + "adsonefwcs"
+    # is_valid, message = lab_system.validate(tampered_string)
+    # print(f"Valid: {is_valid} || Message: {message}") # false, cuz random shit
