@@ -1,0 +1,19 @@
+{
+  "users": [
+    {
+      "AU_id": "AU2540082",
+      "name": "Vansh Shah",
+      "role": "student"
+    },
+    {
+      "AU_id": "AU1111111",
+      "name": "Example Admin",
+      "role": "admin"
+    },
+    {
+      "AU_id": "AU2222222",
+      "name": "Example Faculty",
+      "role": "faculty"
+    }
+  ]
+}

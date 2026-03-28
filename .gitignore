@@ -10,3 +10,4 @@ __pycache__/
 *.tmp
 .idea/
 .vscode/
+/qr_codes
