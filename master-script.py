@@ -149,6 +149,7 @@ def generate_all_qr_codes(users: list[dict], server_ip: str):
         out_path = os.path.join(QR_OUTPUT_DIR, f"{au_id}.png")
         final_img.save(out_path)
         print(f"  📄 QR saved: {out_path}  ({name}, {role})")
+        print(f"     🔗 Link:  {scan_url}")
 
 
 # ── Auth request pool ─────────────────────────────────────────────────────────
