@@ -17,12 +17,12 @@ def ensure_table():
             people_count INTEGER DEFAULT 1,
             status       TEXT CHECK(status IN ('AUTHORISED', 'UNAUTHORISED', 'EXPIRED_AUTH')) NOT NULL DEFAULT 'AUTHORISED',
             screenshot   BLOB,
+            qr_request_id INTEGER DEFAULT NULL,
             timestamp    DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
     c.execute("CREATE INDEX IF NOT EXISTS idx_au_time ON entries(au_id, timestamp)")
 
-    # ── users table: populated at startup from users.json ─────────────────────
     c.execute("""
         CREATE TABLE IF NOT EXISTS users (
             au_id            TEXT PRIMARY KEY,
@@ -32,12 +32,30 @@ def ensure_table():
         )
     """)
 
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS qr_requests (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            au_id        TEXT NOT NULL,
+            name         TEXT NOT NULL,
+            token        TEXT UNIQUE NOT NULL,
+            generated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            expires_at   DATETIME NOT NULL,
+            scanned_at   DATETIME,
+            status       TEXT CHECK(status IN ('pending', 'scanned', 'used', 'expired', 'revoked')) DEFAULT 'pending',
+            entry_log_id INTEGER DEFAULT NULL,
+            FOREIGN KEY(au_id) REFERENCES users(au_id),
+            FOREIGN KEY(entry_log_id) REFERENCES entries(id)
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_qr_token  ON qr_requests(token)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_qr_au_id  ON qr_requests(au_id)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_qr_status ON qr_requests(status)")
+
     conn.commit()
     conn.close()
 
 
 def upsert_user(au_id: str, name: str, role: str, encrypted_payload: str = None):
-    """Insert or replace a user record (called at startup during QR generation)."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
@@ -56,7 +74,6 @@ def upsert_user(au_id: str, name: str, role: str, encrypted_payload: str = None)
 
 
 def lookup_user(au_id: str) -> dict | None:
-    """Return user dict {au_id, name, role} or None if not found."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT au_id, name, role FROM users WHERE au_id = ?", (au_id,))
@@ -68,29 +85,105 @@ def lookup_user(au_id: str) -> dict | None:
 
 
 def log_entry(name: str, au_id: str, role: str, people_count: int,
-              status: str = "AUTHORISED", screenshot: bytes = None):
-    """
-    Log an entry event.
-
-    Parameters
-    ----------
-    status     : 'AUTHORISED' | 'UNAUTHORISED' | 'EXPIRED_AUTH'
-    screenshot : raw JPEG/PNG bytes to store as BLOB (optional)
-    """
+              status: str = "AUTHORISED", screenshot: bytes = None,
+              qr_request_id: int = None) -> int:
     ensure_table()
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
         """
-        INSERT INTO entries (name, au_id, role, people_count, status, screenshot)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO entries (name, au_id, role, people_count, status, screenshot, qr_request_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
-        (name, au_id, role, people_count, status, screenshot),
+        (name, au_id, role, people_count, status, screenshot, qr_request_id),
     )
     conn.commit()
     entry_id = c.lastrowid
     conn.close()
     print(f"  📝 Logged ID {entry_id}: {name} ({role}) | status: {status} | people: {people_count}")
+    return entry_id
+
+
+# ── qr_requests helpers ───────────────────────────────────────────────────────
+
+def create_qr_request(au_id: str, name: str, token: str, expires_at: datetime):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        """
+        INSERT INTO qr_requests (au_id, name, token, expires_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (au_id, name, token, expires_at.isoformat()),
+    )
+    conn.commit()
+    row_id = c.lastrowid
+    conn.close()
+    return row_id
+
+
+def get_qr_request(token: str) -> dict | None:
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "SELECT id, au_id, name, token, expires_at, status FROM qr_requests WHERE token = ?",
+        (token,),
+    )
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return {"id": row[0], "au_id": row[1], "name": row[2],
+                "token": row[3], "expires_at": row[4], "status": row[5]}
+    return None
+
+
+def mark_qr_scanned_atomic(token: str) -> bool:
+    """
+    Atomically marks a qr_request as 'scanned'.
+    Uses BEGIN IMMEDIATE to acquire a write lock before checking status,
+    preventing two simultaneous scans of the same token from both succeeding.
+    Returns True if successful, False if already used/expired/not found.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    conn.isolation_level = None  # manual transaction control
+    c = conn.cursor()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        c.execute("SELECT status FROM qr_requests WHERE token = ?", (token,))
+        row = c.fetchone()
+        if not row or row[0] != "pending":
+            c.execute("ROLLBACK")
+            return False
+        c.execute(
+            "UPDATE qr_requests SET status='scanned', scanned_at=? WHERE token=?",
+            (datetime.now().isoformat(), token),
+        )
+        c.execute("COMMIT")
+        return True
+    except Exception as e:
+        c.execute("ROLLBACK")
+        raise e
+    finally:
+        conn.close()
+
+
+def mark_qr_used(token: str, entry_log_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "UPDATE qr_requests SET status='used', entry_log_id=? WHERE token=?",
+        (entry_log_id, token),
+    )
+    conn.commit()
+    conn.close()
+
+
+def mark_qr_expired(token: str):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE qr_requests SET status='expired' WHERE token=?", (token,))
+    conn.commit()
+    conn.close()
 
 
 # ── CLI helpers ───────────────────────────────────────────────────────────────

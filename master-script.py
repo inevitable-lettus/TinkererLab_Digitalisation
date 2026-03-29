@@ -2,21 +2,21 @@
 master-script.py
 ----------------
 Tinkerer's Lab - Prototype 1 Entry System
-Master script that ties together:
-  - QrCodeHelper   : QR generation & validation
-  - loggingDB      : SQLite entry logging
-  - people_counter : YOLO-based physical entry detection (runs as a thread)
 
 Flow:
-  1. On startup, generates QR codes for all users in users.json and stores
-     user records (name, au_id, role) into the DB.
-  2. Mobile scans QR → hits GET /scan?token=... → validates token, confirms
-     user exists in DB, then creates a 60 s auth request.
-  3. people_counter thread detects physical entry → calls internal handler.
-  4. Handler matches pending auth request → logs AUTHORISED entry.
-     No match found                       → captures screenshot → logs UNAUTHORISED entry.
-  5. Expired auth requests (QR scanned, no physical entry within 60 s) are
-     logged as EXPIRED_AUTH when purged inside pop_valid_auth_request().
+  1. On startup, syncs users from users.json into the DB.
+  2. User navigates to /generate, enters name + AU_id.
+     Backend validates against users.json, generates encrypted QR,
+     stores it in qr_requests table, returns QR image.
+  3. Mobile scans QR → hits GET /scan?token=...
+     Backend atomically marks token as 'scanned' (prevents double-use),
+     then creates a 60 s auth request.
+  4. YOLO thread detects physical entry → calls handle_physical_entry().
+  5. If people_count > 1: log UNAUTHORISED (tailgating).
+     If auth request matches: log AUTHORISED, mark qr_request as 'used'.
+     If no match: log UNAUTHORISED with screenshot.
+  6. Expired auth requests (QR scanned, no entry within 60 s) are logged
+     as EXPIRED_AUTH when purged in pop_valid_auth_request().
 
 Run:
     python master-script.py
@@ -39,35 +39,35 @@ import time
 import argparse
 from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
+from io import BytesIO
 
 import cv2
 import uvicorn
-import qrcode as qrc
-from qrcode.image.styledpil import StyledPilImage
-from qrcode.image.styles.moduledrawers.pil import RoundedModuleDrawer
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, Form
+from fastapi.responses import HTMLResponse, StreamingResponse
 
-# ── Local modules ─────────────────────────────────────────────────────────────
 from QrCodeHelper import LabAccessQrCode, AUColorMask, _finalize_qr
-from loggingDB import log_entry, ensure_table, upsert_user, lookup_user
+from loggingDB import (
+    log_entry, ensure_table, upsert_user, lookup_user,
+    create_qr_request, get_qr_request, mark_qr_scanned_atomic,
+    mark_qr_used, mark_qr_expired,
+)
 from people_counter import run_monitor_loop
 
-# ── Config ────────────────────────────────────────────────────────────────────
 PORT             = 8000
 AUTH_EXPIRY_SECS = 60
+QR_VALID_HOURS   = 24   # QR payload itself is valid for 24 hours
 USERS_FILE       = "users.json"
-QR_OUTPUT_DIR    = "qr_codes"
 
-# ── Shared state (thread-safe via lock) ───────────────────────────────────────
-auth_requests: list[dict] = []   # {au_id, name, role, expires_at}
-state_lock    = threading.Lock()
+# {au_id, name, role, expires_at, token} — token included so we can mark qr_request as used
+auth_requests: list[dict] = []
+state_lock = threading.Lock()
 
-# ── Live frame cache (written by YOLO thread, read on unauthorised entry) ─────
-_latest_frame       = None
-_latest_frame_lock  = threading.Lock()
+_latest_frame      = None
+_latest_frame_lock = threading.Lock()
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
 
 def get_lan_ip() -> str:
     try:
@@ -85,23 +85,21 @@ def load_users(filepath: str) -> list[dict]:
         return json.load(f)["users"]
 
 
-def parse_validate_message(message: str) -> tuple[str, str]:
+def validate_user_pair(name: str, au_id: str, users: list[dict]) -> dict | None:
     """
-    Parse name and AU_id from QrCodeHelper.validate() success message.
-    Format: "Access Granted for {name} (ID: {enrolment_id})."
-    Returns: (name, au_id)
+    Check if (name, au_id) pair exists in the loaded users list.
+    Case-insensitive and strips whitespace so minor typos don't block access.
     """
-    match = re.search(r"Access Granted for (.+?) \(ID: (.+?)\)\.", message)
-    if match:
-        return match.group(1), match.group(2)
-    return "Unknown", "Unknown"
+    name_normalized  = name.strip().title()
+    au_id_normalized = au_id.strip().upper()
+    for user in users:
+        if (user["name"].strip().title()  == name_normalized and
+            user["AU_id"].strip().upper() == au_id_normalized):
+            return user
+    return None
 
 
 def capture_screenshot() -> bytes | None:
-    """
-    Grab the most recent camera frame and encode it as JPEG bytes.
-    Returns None if no frame is available yet.
-    """
     with _latest_frame_lock:
         frame = _latest_frame
     if frame is None:
@@ -110,59 +108,17 @@ def capture_screenshot() -> bytes | None:
     return buffer.tobytes() if success else None
 
 
-def generate_all_qr_codes(users: list[dict], server_ip: str):
-    """
-    Generate one QR code per user and store user records in the DB.
-    Role is read from users.json (falls back to 'student' if absent).
-    """
-    os.makedirs(QR_OUTPUT_DIR, exist_ok=True)
-    qr_helper = LabAccessQrCode(expiration_minutes=AUTH_EXPIRY_SECS // 60)
-
-    for user in users:
-        au_id = user["AU_id"]
-        name  = user["name"]
-        role  = user.get("role", "student")   # read from users.json
-
-        # Generate encrypted payload
-        payload, _ = qr_helper.generate(name=name, enrolment_id=au_id)
-
-        # ── Store user record in DB ──────────────────────────────────────────
-        upsert_user(au_id=au_id, name=name, role=role, encrypted_payload=payload)
-
-        # Build scan URL and re-encode QR with the full URL
-        scan_url = f"http://{server_ip}:{PORT}/scan?token={payload}"
-
-        qr = qrc.QRCode(
-            error_correction=qrc.constants.ERROR_CORRECT_H,  # type: ignore
-            box_size=12,
-            border=2,
-        )
-        qr.add_data(scan_url)
-        qr.make(fit=True)
-        raw_img = qr.make_image(
-            image_factory=StyledPilImage,
-            module_drawer=RoundedModuleDrawer(radius_ratio=0.8),
-            color_mask=AUColorMask(),
-        )
-        final_img = _finalize_qr(raw_img, None)
-
-        out_path = os.path.join(QR_OUTPUT_DIR, f"{au_id}.png")
-        final_img.save(out_path)
-        print(f"  📄 QR saved: {out_path}  ({name}, {role})")
-        print(f"     🔗 Link:  {scan_url}")
-
-
 # ── Auth request pool ─────────────────────────────────────────────────────────
 
-def create_auth_request(au_id: str, name: str, role: str):
-    expires_at = datetime.now() + timedelta(seconds=AUTH_EXPIRY_SECS)
+def create_auth_request(au_id: str, name: str, role: str, token: str):
+    expires_at = datetime.now() + timedelta(seconds=AUTH_EXPIRY_SECS) #current time + number of seconds
     with state_lock:
-        # Remove any existing request for same user (re-scan case)
-        auth_requests[:] = [r for r in auth_requests if r["au_id"] != au_id]
+        auth_requests[:] = [r for r in auth_requests if r["au_id"] != au_id] #new auth req created if au_id not found
         auth_requests.append({
             "au_id":      au_id,
             "name":       name,
             "role":       role,
+            "token":      token,   # kept so we can update qr_requests.status on entry
             "expires_at": expires_at,
         })
     print(f"  🔑 Auth request created: {name} ({au_id}, {role}) — expires in {AUTH_EXPIRY_SECS}s")
@@ -171,25 +127,19 @@ def create_auth_request(au_id: str, name: str, role: str):
 def pop_valid_auth_request() -> dict | None:
     """
     Remove and return the oldest non-expired auth request.
-    Any expired requests found during cleanup are logged as EXPIRED_AUTH.
-    Returns None if no valid request exists.
+    Expired requests are logged as EXPIRED_AUTH and their qr_request marked 'expired'.
     """
     now = datetime.now()
     with state_lock:
         expired  = [r for r in auth_requests if r["expires_at"] <= now]
         valid    = [r for r in auth_requests if r["expires_at"] >  now]
-        auth_requests[:] = valid
+        auth_requests[:] = valid #only valid reqs left
 
-    # Log expired requests outside the lock to avoid holding it during DB I/O
     for r in expired:
-        print(f"  ⏰ Auth request expired (no physical entry): {r['name']} ({r['au_id']})")
-        log_entry(
-            name=r["name"],
-            au_id=r["au_id"],
-            role=r["role"],
-            people_count=0,
-            status="EXPIRED_AUTH",
-        )
+        print(f"  ⏰ Auth expired (no entry): {r['name']} ({r['au_id']})")
+        log_entry(name=r["name"], au_id=r["au_id"], role=r["role"],
+                  people_count=0, status="EXPIRED_AUTH")
+        mark_qr_expired(r["token"])
 
     if valid:
         with state_lock:
@@ -201,64 +151,56 @@ def pop_valid_auth_request() -> dict | None:
 # ── Physical entry handler (called by YOLO thread) ────────────────────────────
 
 def handle_physical_entry(people_count: int):
-    """
-    Called whenever YOLO detects a person crossing the entry line.
-    Matches against pending auth requests and logs accordingly.
-    """
     timestamp = datetime.now().strftime("%H:%M:%S")
+
+    # Tailgating: more than one person → deny immediately
+    # Tailgating should only be declared if the number of people entering is greater than the number of valid auth requests - NEEDS CHANGE
+    now = datetime.now()
+    with state_lock:
+        valid_auth_count = len([r for r in auth_requests if r["expires_at"] > now])
+
+    if people_count > 1 and people_count > valid_auth_count:
+        print(f"\n❌ [{timestamp}] TAILGATING DETECTED ({people_count} people) — Denied")
+        screenshot = capture_screenshot()
+        log_entry(name="Unauthorized Group", au_id="N/A", role="student",
+                  people_count=people_count, status="UNAUTHORISED", screenshot=screenshot)
+        return
+
     auth = pop_valid_auth_request()
 
     if auth:
-        print(f"\n✅ [{timestamp}] AUTHORISED ENTRY — {auth['name']} ({auth['au_id']})")
-        log_entry(
-            name=auth["name"],
-            au_id=auth["au_id"],
-            role=auth["role"],
-            people_count=people_count,
-            status="AUTHORISED",
-        )
+        print(f"\n✅ [{timestamp}] AUTHORISED — {auth['name']} ({auth['au_id']})")
+        entry_id = log_entry(name=auth["name"], au_id=auth["au_id"], role=auth["role"],
+                             people_count=1, status="AUTHORISED", qr_request_id=None)
+        mark_qr_used(auth["token"], entry_id)
     else:
-        print(f"\n🚨 [{timestamp}] UNAUTHORISED ENTRY DETECTED (people in frame: {people_count})")
+        print(f"\n🚨 [{timestamp}] UNAUTHORISED — No matching auth request")
         screenshot = capture_screenshot()
-        log_entry(
-            name="Unknown",
-            au_id="N/A",
-            role="student",       # schema requires non-null; unknown role defaults to student
-            people_count=people_count,
-            status="UNAUTHORISED",
-            screenshot=screenshot,
-        )
+        log_entry(name="Unknown", au_id="N/A", role="student",
+                  people_count=1, status="UNAUTHORISED", screenshot=screenshot)
         if screenshot:
-            print(f"  📸 Screenshot captured ({len(screenshot)} bytes) and stored in DB")
+            print(f"  📸 Screenshot captured ({len(screenshot)} bytes)")
         else:
-            print(f"  ⚠️  No screenshot available (frame not ready yet)")
+            print(f"  ⚠️  No screenshot available")
 
 
 # ── YOLO thread ───────────────────────────────────────────────────────────────
 
 def _entry_callback(people_in_frame: int):
-    """Called by run_monitor_loop on every line crossing."""
     handle_physical_entry(people_in_frame)
 
 
-def _frame_cache_callback(frame) -> None:
-    """Called by run_monitor_loop on every frame to keep _latest_frame fresh."""
+def _frame_cache_callback(frame):
     with _latest_frame_lock:
         global _latest_frame
         _latest_frame = frame.copy()
 
 
-def run_people_counter_thread(source: int | str, line_y: int, visual: bool):
-    """
-    Runs the YOLO monitor loop, restarting automatically on any crash so the
-    system stays live indefinitely. Only stops on KeyboardInterrupt.
-    """
+def run_people_counter_thread(source, line_y: int, visual: bool):
     while True:
         try:
             run_monitor_loop(
-                source=source,
-                line_y=line_y,
-                visual=visual,
+                source=source, line_y=line_y, visual=visual,
                 on_entry_callback=_entry_callback,
                 on_frame_callback=_frame_cache_callback,
             )
@@ -274,39 +216,116 @@ def run_people_counter_thread(source: int | str, line_y: int, visual: bool):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
     ensure_table()
     server_ip = get_lan_ip()
     app.state.server_ip = server_ip
-    app.state.qr_helper = LabAccessQrCode(expiration_minutes=AUTH_EXPIRY_SECS // 60)
+    app.state.qr_helper = LabAccessQrCode(expiration_minutes=QR_VALID_HOURS * 60)
 
     print(f"\n🌐 Server IP  : {server_ip}")
-    print(f"🔗 Scan URL   : http://{server_ip}:{PORT}/scan?token=<payload>")
+    print(f"🔗 Generate   : http://{server_ip}:{PORT}/generate")
     print(f"📋 Logs API   : http://{server_ip}:{PORT}/logs\n")
 
     users = load_users(args.users)
+    app.state.users = users
     print(f"👥 Loaded {len(users)} user(s) from {args.users}")
-    print("Generating QR codes and syncing users to DB...\n")
-    generate_all_qr_codes(users, server_ip)
+
+    # Sync all users into DB so lookup_user() works at /scan time
+    for user in users:
+        upsert_user(au_id=user["AU_id"], name=user["name"], role=user.get("role", "student"))
+    print("✅ Users synced to DB\n")
 
     yield
-    # Shutdown (nothing to clean up for now)
 
 
 app = FastAPI(title="Tinkerer's Lab Entry System", lifespan=lifespan)
+
+
+@app.get("/generate", response_class=HTMLResponse)
+async def generate_page():
+    """Shows the QR generation form."""
+    return HTMLResponse(content=_render_generate_form())
+
+
+@app.post("/generate")
+async def generate_qr(name: str = Form(...), au_id: str = Form(...)):
+    """
+    Validates (name, au_id) against users.json, generates an encrypted QR,
+    stores the request in qr_requests, and returns the QR image inline.
+    """
+    users = app.state.users
+    user = validate_user_pair(name, au_id, users)
+
+    if not user:
+        return HTMLResponse(content=_render_page(
+            title="Not Found",
+            emoji="🚫",
+            message="Name and AU ID don't match our records. Check your details.",
+            colour="#b00020",
+            extra_link=('<a href="/generate" style="color:#c9c0be;">← Try again</a>'),
+        ), status_code=400)
+
+    qr_helper: LabAccessQrCode = app.state.qr_helper
+    server_ip = app.state.server_ip
+
+#This is a fresh QR code generating script, can be replaced with existing code - NEEDS CHANGE
+    # Generate token and QR image — payload encodes name + au_id + timestamp
+    token, buffer = qr_helper.generate(
+        name=user["name"], 
+        enrolment_id=user["AU_id"],
+        url_template=f"http://{server_ip}:{PORT}/scan?token={{token}}"
+    )
+
+    # Store in DB — expires_at is 24h from now (auth window is still 60 s post-scan)
+    expires_at = datetime.now() + timedelta(hours=QR_VALID_HOURS)
+    create_qr_request(au_id=user["AU_id"], name=user["name"],
+                      token=token, expires_at=expires_at)
+
+    print(f"  🖨️  QR generated for {user['name']} ({user['AU_id']})")
+
+    return StreamingResponse(buffer, media_type="image/png",
+                             headers={"Content-Disposition": "inline"})
 
 
 @app.get("/scan", response_class=HTMLResponse)
 async def scan_qr(token: str):
     """
     Mobile browser hits this after scanning QR.
-    1. Validates the encrypted token via QrCodeHelper.
-    2. Confirms the user exists in the DB.
-    3. Creates a 60 s auth request with the correct role.
+    1. Looks up the token in qr_requests (stateful check).
+    2. Atomically marks it as 'scanned' to prevent double-use.
+    3. Validates the cryptographic payload.
+    4. Creates a 60 s auth request.
     """
+    # Stateful check first
+    qr_req = get_qr_request(token)
+    if not qr_req:
+        return HTMLResponse(content=_render_page(
+            title="Invalid QR",
+            emoji="🚫",
+            message="QR not recognised. Please generate a new one at the door terminal.",
+            colour="#b00020",
+        ), status_code=403)
+
+    if qr_req["status"] != "pending":
+        return HTMLResponse(content=_render_page(
+            title="QR Already Used",
+            emoji="⛔",
+            message=f"This QR has already been used (status: {qr_req['status']}). Generate a new one.",
+            colour="#b00020",
+        ), status_code=403)
+
+    # Atomic mark-as-scanned before doing anything else (prevents race condition)
+    claimed = mark_qr_scanned_atomic(token)
+    if not claimed:
+        return HTMLResponse(content=_render_page(
+            title="QR Already Used",
+            emoji="⛔",
+            message="This QR was just used by someone else. Please generate a new one.",
+            colour="#b00020",
+        ), status_code=403)
+
+    # Cryptographic validation (checks AES-GCM integrity + 24h timestamp window)
     qr_helper: LabAccessQrCode = app.state.qr_helper
     is_valid, message = qr_helper.validate(token)
-
     if not is_valid:
         return HTMLResponse(content=_render_page(
             title="Access Denied",
@@ -315,25 +334,27 @@ async def scan_qr(token: str):
             colour="#b00020",
         ), status_code=403)
 
-    name, au_id = parse_validate_message(message)
-
-    # ── DB lookup: confirm user is registered ────────────────────────────────
-    user_record = lookup_user(au_id)
+    # Pull user data from qr_request row (already validated against users.json at generation)
+    user_record = lookup_user(qr_req["au_id"])
     if not user_record:
         return HTMLResponse(content=_render_page(
             title="Access Denied",
             emoji="🚫",
-            message="Your QR code is valid but your account is not registered. Contact a lab admin.",
+            message="Account not registered. Contact a lab admin.",
             colour="#b00020",
         ), status_code=403)
 
-    role = user_record["role"]
-    create_auth_request(au_id=au_id, name=name, role=role)
+    create_auth_request(
+        au_id=user_record["au_id"],
+        name=qr_req["name"],
+        role=user_record["role"],
+        token=token,
+    )
 
     return HTMLResponse(content=_render_page(
         title="QR Validated",
         emoji="✅",
-        message=f"Welcome, {name}!<br><small>Please walk through the door within {AUTH_EXPIRY_SECS} seconds.</small>",
+        message=f"Welcome, {qr_req['name']}!<br><small>Please walk through the door within {AUTH_EXPIRY_SECS} seconds.</small>",
         colour="#1b5e20",
     ), status_code=200)
 
@@ -345,7 +366,7 @@ async def get_logs():
     conn = sqlite3.connect("entry_logs.db")
     c = conn.cursor()
     c.execute("""
-        SELECT id, name, au_id, role, people_count, status, timestamp
+        SELECT id, name, au_id, role, people_count, status, qr_request_id, timestamp
         FROM entries
         ORDER BY timestamp DESC
         LIMIT 20
@@ -353,15 +374,8 @@ async def get_logs():
     rows = c.fetchall()
     conn.close()
     return [
-        {
-            "id":           r[0],
-            "name":         r[1],
-            "au_id":        r[2],
-            "role":         r[3],
-            "people_count": r[4],
-            "status":       r[5],
-            "timestamp":    r[6],
-        }
+        {"id": r[0], "name": r[1], "au_id": r[2], "role": r[3],
+         "people_count": r[4], "status": r[5], "qr_request_id": r[6], "timestamp": r[7]}
         for r in rows
     ]
 
@@ -372,12 +386,8 @@ async def get_pending():
     now = datetime.now()
     with state_lock:
         active = [
-            {
-                "au_id":      r["au_id"],
-                "name":       r["name"],
-                "role":       r["role"],
-                "expires_in": round((r["expires_at"] - now).total_seconds()),
-            }
+            {"au_id": r["au_id"], "name": r["name"], "role": r["role"],
+             "expires_in": round((r["expires_at"] - now).total_seconds())}
             for r in auth_requests if r["expires_at"] > now
         ]
     return {"pending": active}
@@ -385,18 +395,14 @@ async def get_pending():
 
 @app.get("/trigger")
 async def trigger_entry(people: int = 1):
-    """
-    Testing endpoint — simulates a physical door crossing without a camera.
-    Hit this after scanning a QR to test the full authorised/unauthorised flow.
-    Example: GET /trigger or GET /trigger?people=2
-    """
+    """Testing endpoint — simulates a physical door crossing without a camera."""
     handle_physical_entry(people_count=people)
     return {"simulated": True, "people_count": people}
 
 
-# ── HTML response renderer ────────────────────────────────────────────────────
+# ── HTML renderers ────────────────────────────────────────────────────────────
 
-def _render_page(title: str, emoji: str, message: str, colour: str) -> str:
+def _render_page(title: str, emoji: str, message: str, colour: str, extra_link: str = "") -> str:
     return f"""
     <!DOCTYPE html>
     <html lang="en">
@@ -426,6 +432,7 @@ def _render_page(title: str, emoji: str, message: str, colour: str) -> str:
         .emoji {{ font-size: 4rem; margin-bottom: 1rem; }}
         h1 {{ font-size: 1.5rem; color: {colour}; margin-bottom: 1rem; }}
         p  {{ font-size: 1rem; line-height: 1.6; color: #c9c0be; }}
+        .link {{ margin-top: 1.2rem; font-size: 0.9rem; }}
       </style>
     </head>
     <body>
@@ -433,6 +440,71 @@ def _render_page(title: str, emoji: str, message: str, colour: str) -> str:
         <div class="emoji">{emoji}</div>
         <h1>{title}</h1>
         <p>{message}</p>
+        {f'<div class="link">{extra_link}</div>' if extra_link else ''}
+      </div>
+    </body>
+    </html>
+    """
+
+
+def _render_generate_form() -> str:
+    return """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="UTF-8"/>
+      <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+      <title>Generate Entry QR</title>
+      <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+          min-height: 100vh;
+          display: flex; align-items: center; justify-content: center;
+          background: #0e0a0a;
+          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+          color: #f5f0ee;
+          padding: 2rem;
+        }
+        .card {
+          background: #1a1414;
+          border: 2px solid #85160f;
+          border-radius: 16px;
+          padding: 2.5rem 2rem;
+          max-width: 360px;
+          width: 100%;
+          text-align: center;
+        }
+        h1 { font-size: 1.4rem; color: #85160f; margin-bottom: 0.4rem; }
+        .sub { font-size: 0.85rem; color: #888; margin-bottom: 1.8rem; }
+        label { display: block; text-align: left; font-size: 0.85rem;
+                color: #aaa; margin-bottom: 0.3rem; }
+        input {
+          width: 100%; padding: 0.7rem 1rem;
+          background: #0e0a0a; border: 1px solid #444;
+          border-radius: 8px; color: #f5f0ee; font-size: 1rem;
+          margin-bottom: 1.2rem; outline: none;
+        }
+        input:focus { border-color: #85160f; }
+        button {
+          width: 100%; padding: 0.8rem;
+          background: #85160f; border: none; border-radius: 8px;
+          color: #fff; font-size: 1rem; cursor: pointer;
+          font-weight: 600; letter-spacing: 0.03em;
+        }
+        button:hover { background: #a01e15; }
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <h1>🔐 Tinkerer's Lab</h1>
+        <p class="sub">Enter your details to get a QR code for entry</p>
+        <form method="post" action="/generate">
+          <label for="name">Full Name</label>
+          <input id="name" name="name" type="text" placeholder="Vansh Shah" required/>
+          <label for="au_id">AU ID</label>
+          <input id="au_id" name="au_id" type="text" placeholder="AU2540082" required/>
+          <button type="submit">Generate QR</button>
+        </form>
       </div>
     </body>
     </html>
@@ -443,33 +515,26 @@ def _render_page(title: str, emoji: str, message: str, colour: str) -> str:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Tinkerer's Lab Master Script")
-    parser.add_argument("--users",  default=USERS_FILE, help="Path to users.json")
-    parser.add_argument("--source", default="0",        help="Camera source (default: 0 for webcam)")
-    parser.add_argument("--line-y", type=int, default=300, help="YOLO entry line Y-coordinate")
-    parser.add_argument("--visual", action="store_true",   help="Show YOLO camera window")
+    parser.add_argument("--users",  default=USERS_FILE)
+    parser.add_argument("--source", default="0")
+    parser.add_argument("--line-y", type=int, default=300)
+    parser.add_argument("--visual", action="store_true")
     args = parser.parse_args()
 
-    # macOS requires camera/OpenCV to run on the main thread.
-    # Solution: uvicorn runs in a background daemon thread; YOLO runs on main thread.
     uvicorn_thread = threading.Thread(
         target=lambda: uvicorn.run(app, host="0.0.0.0", port=PORT),
         daemon=True,
     )
     uvicorn_thread.start()
 
-    # Give uvicorn a moment to bind and run lifespan startup (QR gen, DB init)
     time.sleep(3)
 
-    # YOLO loop on main thread — required on macOS for camera access.
-    # If the camera source is unavailable we fall back to an idle loop so the
-    # FastAPI server (and /trigger endpoint) keeps running regardless.
     source = int(args.source) if str(args.source).isdigit() else args.source
     try:
         run_people_counter_thread(source, args.line_y, args.visual)
     except KeyboardInterrupt:
         pass
     finally:
-        # Keep the process alive so the uvicorn daemon thread stays running.
         print("\n⚠️  YOLO monitor stopped — server still running. Press Ctrl+C again to exit.")
         try:
             while True:

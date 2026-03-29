@@ -11,3 +11,4 @@ __pycache__/
 .idea/
 .vscode/
 /qr_codes
+entry_logs.db

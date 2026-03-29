@@ -20,35 +20,11 @@ DARK_BG   = (14, 10, 10)  # near-black with faint red warmth
 class AUColorMask(SolidFillColorMask):
     """
     Dark-theme color mask:
-      - Background  -> deep near-black  (DARK_BG)
-      - QR modules  -> off-white        (OFF_WHITE)  <- high contrast on dark
-      - Finder eyes -> crimson          (CRIMSON)    <- brand accent
+      - Background -> deep near-black (DARK_BG)
+      - QR modules -> off-white (OFF_WHITE) <- high contrast on dark
     """
     def __init__(self):
         super().__init__(front_color=OFF_WHITE, back_color=DARK_BG)
-        self.eye_color = CRIMSON
-
-    def initialize(self, styledPilImage, image):
-        super().initialize(styledPilImage, image)
-        self._box_size = styledPilImage.box_size
-        self._border   = styledPilImage.border
-        self._img_size = image.size
-
-    def apply_mask(self, image):
-        super().apply_mask(image)
-
-        draw = ImageDraw.Draw(image)
-        box_size = self._box_size
-        border = self._border * box_size
-        eye_size = 7 * box_size
-        w, h = self._img_size
-
-        for x0, y0, x1, y1 in [
-            (border,              border,              border + eye_size,     border + eye_size),
-            (w-border-eye_size,   border,              w-border,              border + eye_size),
-            (border,              h-border-eye_size,   border + eye_size,     h-border),
-        ]:
-            draw.rectangle([x0, y0, x1, y1], fill=self.eye_color)
 
 
 def _make_rounded_mask(size, radius):
@@ -139,7 +115,7 @@ class LabAccessQrCode:
     def __init__(self, expiration_minutes=60, logo_path=None):
         self.expiration = timedelta(minutes=expiration_minutes)
         self.logo_path  = logo_path if (logo_path and os.path.isfile(logo_path)) else None
-    def generate(self, name, enrolment_id):
+    def generate(self, name, enrolment_id, url_template=None):
         if not name or not enrolment_id:
             raise ValueError("Name and Enrolment ID must be non-empty strings")
         current_time = datetime.now().isoformat()
@@ -149,12 +125,15 @@ class LabAccessQrCode:
         ciphertext = aes.encrypt(nonce, text_to_encrypt.encode('utf-8'), None)
         payload = nonce + ciphertext
         encoded_payload = base64.urlsafe_b64encode(payload).decode('utf-8')
+
+        qr_data = url_template.format(token=encoded_payload) if url_template else encoded_payload
+
         qr = QrCodeHelper.QRCode(
             error_correction=QrCodeHelper.ERROR_CORRECT_H,
             box_size=12,
-            border=2,
+            border=4,
         )
-        qr.add_data(encoded_payload)
+        qr.add_data(qr_data)
         qr.make(fit=True)
         raw_img = qr.make_image(
             image_factory=StyledPilImage,
